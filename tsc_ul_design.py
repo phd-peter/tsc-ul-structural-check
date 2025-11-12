@@ -19,15 +19,20 @@ class DesignInputs:
     y_support_condition: str = 'pinned'  # 'pinned' or 'fixed' for y-dir
     
     # Angle properties
-    angle_fy: float  # 앵글 Fy (MPa)
-    angle_es: float  # 앵글 Es (MPa)
-    upper_angle_section: Dict[str, float]  # 상부앵글 단면 크기 (e.g., {'b': width, 't': thickness, ...})
-    lower_angle_section: Dict[str, float]  # 하부앵글 단면 크기
+    angle_fy: float = 235.0  # 앵글 Fy (MPa)
+    angle_es: float = 200000.0  # 앵글 Es (MPa)
+    upper_angle_section: Dict[str, float] = None  # 상부앵글 단면 크기 (e.g., {'b': width, 't': thickness, ...})
+    lower_angle_section: Dict[str, float] = None  # 하부앵글 단면 크기
     
     # L-form properties
-    lform_fy: float  # L폼 Fy (MPa)
-    lform_es: float  # L폼 Es (MPa)
-    lform_section_properties: Dict[str, float]  # 단면계수, 2차모멘트, 도심 etc.
+    lform_fy: float = 235.0  # L폼 Fy (MPa)
+    lform_es: float = 200000.0  # L폼 Es (MPa)
+    lform_section_properties: Dict[str, float] = None  # 단면계수, 2차모멘트, 도심 etc. (e.g., {'I': 1e6, 'S': 1e4, 'e': 0.0})
+    
+    # Web/Rebar properties for construction shear
+    rebar_area: float = 112.64  # mm² per rebar
+    rebar_spacing: float = 100.0  # mm along beam
+    web_clear_height: float = 500.0  # mm, clear vertical spacing between inner faces
 
 class TSCULDesign:
     """Main class for TSC UL type design program"""
@@ -48,7 +53,7 @@ class TSCULDesign:
     def module2_construction_load_check(self) -> Dict[str, Any]:
         """Module 2: Construction load structural strength calculation and comparison.
         As per PRD section 3.2 and user specs: Calculate DL/LL for y-dir (uniform, tributary y_span/(num_y_girders+1)),
-        point loads P for x-dir at positions depending on num_y_girders (e.g., n=1: L/2; n=2: L/3, 2L/3; general: i*L/(n+1) for i=1 to n),
+        point loads P for x-dir at positions depending on num_y_girders (e.g., n=1: L/2; n=2: L/3, 2L/3),
         then Mu/Vu for both directions based on support conditions.
         Compute bending and shear capacities (placeholder); compare.
         Assumes weld is safe.
@@ -60,7 +65,7 @@ class TSCULDesign:
         tributary_width_y = self.inputs.x_span / (self.inputs.num_y_girders + 1)  # m
         dl_y = self.inputs.slab_thickness * self.inputs.concrete_density * tributary_width_y  # kN/m (uniform)
         ll_y = self.inputs.construction_live_load * tributary_width_y  # kN/m (uniform)
-        
+
         w_y = 1.2*dl_y + 1.6*ll_y  # 1.2DL+1.6LL, total uniform load kN/m
         
         # y-dir girder DEMAND. uniform load, support-dependent
@@ -81,13 +86,12 @@ class TSCULDesign:
             raise ValueError("y_support_condition must be 'pinned' or 'fixed'")
         
         # x-dir girder loads: point loads from y-dir reactions at positions depending on num_y_girders
-        # For general n = num_y_girders, positions = [i * L_x / (n + 1) for i in range(1, n+1)]
         # Each point load P = (w_y * y_span)  (end reaction per y-beam, assuming symmetric placement)
-        # Note: Total point loads = n (one per y-beam, but actually 2 per beam; simplified to n effective symmetric points)
-        # For n=1: position L/2, single P (or two at ends but central equiv.)
+        # Note: Total point loads = n 
+        # For n=1: position L/2, single P
         # For n=2: positions L/3, 2L/3, two P's
         n = self.inputs.num_y_girders
-        p = (w_y * self.inputs.y_span)  # kN per point load (상하부 y축 beam이 대칭으로 존재하기때문에. y_span 전체를 사용해야함.)
+        p = (w_y * self.inputs.y_span)  # kN per point load (상하부 y축 beam이 평면상 상하 대칭으로 존재하기때문에. y_span 전체를 사용해야함.)
         l_x = self.inputs.x_span  # m
 
         if n == 1:
@@ -128,12 +132,38 @@ class TSCULDesign:
             mu_x = 0.0  # placeholder
             vu_x = 0.0
         
-        # Placeholder capacities (to be implemented with angle/L-form sections)
-        # e.g., mn_y = ... based on AISC for composite section
-        capacity_mn_y = 0.0  # kNm
-        capacity_vn_y = 0.0  # kN
-        capacity_mn_x = 0.0  # kNm
-        capacity_vn_x = 0.0  # kN
+        # Capacities for construction phase (angles + rebar web equivalent)
+        upper_angle = self.inputs.upper_angle_section
+        a = upper_angle['b']  # mm, leg length
+        t = upper_angle['t']  # mm, thickness
+        A_angle = 2 * a * t - t**2  # mm²
+        A_f = 2 * A_angle  # mm² per one angle (two angles per top chord)
+        c = t * ((a - t) * (t / 2) + a * (a / 2)) / A_angle  # mm from outer face of horizontal leg
+        c_inner = c - t  # mm to inner face
+        h_clear = self.inputs.web_clear_height  # mm, clear vertical spacing between inner faces
+        d = h_clear + 2 * c_inner  # mm, distance between flange centroids
+        Z_x = A_f * d  # mm³, approximate plastic modulus (flanges dominate)
+        fy = self.inputs.angle_fy  # MPa
+        capacity_mn_y = fy * Z_x * 1e-6  # kNm
+        capacity_mn_x = capacity_mn_y  # assume same section for x-dir
+        
+        # Shear capacity using equivalent web from rebars
+        h_w = self.inputs.web_clear_height  # mm, web height (using clear height)
+        s = self.inputs.rebar_spacing  # mm, rebar spacing along beam
+        A_b = self.inputs.rebar_area  # mm² per rebar
+        num_sides = 2  # left and right
+        t_w = num_sides * A_b / s  # equivalent web thickness, mm
+        A_w = t_w * h_clear  # mm²
+        capacity_vn_y = 0.6 * fy * A_w * 1e-3  # kN
+        capacity_vn_x = capacity_vn_y  # same
+        
+        # Shear flow for composite action (demand for rebar welds)
+        s_m = s / 1000.0  # m
+        h_m = d / 1000.0  # m, lever arm
+        q_y = vu_y / h_m if h_m > 0 else 0.0  # kN/m
+        T_b_y = q_y * s_m  # kN per rebar/panel
+        q_x = vu_x / h_m if h_m > 0 else 0.0  # kN/m
+        T_b_x = q_x * s_m  # kN per rebar/panel
         
         positions = [l_x / 2] if n == 1 else [l_x / 3, 2 * l_x / 3]
         
@@ -161,7 +191,19 @@ class TSCULDesign:
             'num_y_girders': n,
             'x_point_positions': positions,
             'y_support_condition': self.inputs.y_support_condition,
-            'x_support_condition': self.inputs.x_support_condition
+            'x_support_condition': self.inputs.x_support_condition,
+            # Shear properties
+            'h_w': h_clear,
+            's': s,
+            'A_b': A_b,
+            'q_y': q_y,
+            'T_b_y': T_b_y,
+            'q_x': q_x,
+            'T_b_x': T_b_x,
+            'y_shear_flow_q': q_y,  # kN/m
+            'y_transverse_force_per_rebar': T_b_y,  # kN
+            'x_shear_flow_q': q_x,  # kN/m
+            'x_transverse_force_per_rebar': T_b_x  # kN
         }
         self.results['module2'] = result
         return result
@@ -249,13 +291,16 @@ if __name__ == "__main__":
         num_y_girders=2,
         x_support_condition='fixed',
         y_support_condition='pinned',
-        angle_fy=235.0,
+        angle_fy=355.0,
         angle_es=200000.0,
         upper_angle_section={'b': 100, 't': 10},  # mm
         lower_angle_section={'b': 100, 't': 10},
-        lform_fy=235.0,
+        lform_fy=200.0,
         lform_es=200000.0,
-        lform_section_properties={'I': 1e6, 'S': 1e4, 'e': 0.0}  # Placeholder units
+        lform_section_properties={'I': 1e6, 'S': 1e4, 'e': 0.0},  # Placeholder units
+        rebar_area=112.64,
+        rebar_spacing=100.0,
+        web_clear_height=500.0
     )
     
     design = TSCULDesign(example_inputs)
